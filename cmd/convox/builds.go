@@ -10,6 +10,8 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"gopkg.in/urfave/cli.v1"
@@ -20,6 +22,7 @@ import (
 	"github.com/docker/docker/builder/dockerignore"
 	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/fileutils"
+	"github.com/docker/libcompose/config"
 )
 
 var (
@@ -48,6 +51,17 @@ var (
 		},
 	}
 )
+
+type buildContext struct {
+	Source    string
+	PathDepth int
+}
+
+type buildContexts []buildContext
+
+func (bc buildContexts) Len() int           { return len(bc) }
+func (bc buildContexts) Less(i, j int) bool { return bc[i].PathDepth < bc[j].PathDepth }
+func (bc buildContexts) Swap(i, j int)      { bc[i], bc[j] = bc[j], bc[i] }
 
 func init() {
 	stdcli.RegisterCommand(cli.Command{
@@ -275,6 +289,11 @@ func executeBuild(c *cli.Context, source, app, manifest, description string) (st
 	case "http", "https":
 		return executeBuildUrl(c, source, app, manifest, description)
 	default:
+		source, err := highestBuildContext(source, manifest)
+		if err != nil {
+			return "", fmt.Errorf("Error: %v", err)
+		}
+
 		if c.Bool("incremental") {
 			return executeBuildDirIncremental(c, source, app, manifest, description)
 		} else {
@@ -283,6 +302,36 @@ func executeBuild(c *cli.Context, source, app, manifest, description string) (st
 	}
 
 	return "", fmt.Errorf("unreachable")
+}
+
+func highestBuildContext(source string, manifest string) (string, error) {
+	data, err := ioutil.ReadFile(manifest)
+	if err != nil {
+		return "", err
+	}
+
+	// Using libcompose.config.Merge provides uniform access to the build context (across V1 and V2 manifests)
+	_, serviceConfig, _, _, err := config.Merge(config.NewServiceConfigs(), nil, nil, manifest, data, nil)
+	if err != nil {
+		return "", err
+	}
+
+	buildContexts := buildContexts{}
+
+	for service := range serviceConfig {
+		path, err := filepath.Abs(source + string(filepath.Separator) + serviceConfig[service].Build.Context)
+		if err != nil {
+			return "", err
+		}
+
+		depth := len(strings.Split(path, string(filepath.Separator)))
+
+		buildContexts = append(buildContexts, buildContext{Source: path, PathDepth: depth})
+	}
+
+	sort.Sort(buildContexts)
+
+	return buildContexts[0].Source, nil
 }
 
 func createIndex(dir string) (client.Index, error) {
